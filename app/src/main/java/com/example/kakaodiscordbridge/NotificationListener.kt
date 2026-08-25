@@ -27,6 +27,10 @@ class NotificationListener : NotificationListenerService() {
     private var alertEmbedMessageId: String? = null
     private var cleanupThread: Thread? = null
 
+    private var syncLock = Object()
+    private var lastKakaoMsg = ""
+    private var lastKakaoTime = 0L
+
     private val pendingMessages = java.util.concurrent.LinkedBlockingQueue<Triple<String, String, Notification>>()
     private val replyActions = ConcurrentHashMap<String, Notification.Action>()
     private val sentMessages = mutableListOf<Triple<String, String, Long>>()
@@ -164,6 +168,13 @@ class NotificationListener : NotificationListenerService() {
     private fun handleKakao(title: String, text: String, extras: Bundle, notification: Notification, sbn: StatusBarNotification) {
         if (text.contains("보이스톡") || text.contains("통화 중") || text.contains("연결 중")) return
 
+        // 중복 메시지 체크
+        val msgKey = "${title}:${text}"
+        val now = System.currentTimeMillis()
+        if (msgKey == lastKakaoMsg && now - lastKakaoTime < 3000) return
+        lastKakaoMsg = msgKey
+        lastKakaoTime = now
+
         val isGroup = extras.getBoolean("android.isGroupConversation", false)
         val subText = extras.getCharSequence("android.subText")?.toString() ?: ""
         val sender = title
@@ -249,111 +260,115 @@ class NotificationListener : NotificationListenerService() {
         if (config?.alertChannelId.isNullOrEmpty()) return
 
         Thread {
-            try {
-                val messages = mutableListOf<String>()
-                val pinned = mutableListOf<String>()
+            synchronized(syncLock) {
+                try {
+                    val messages = mutableListOf<String>()
+                    val pinned = mutableListOf<String>()
 
-                for (sbn in activeNotifications) {
-                    val pkg = sbn.packageName
-                    if (pkg == "com.example.kakaodiscordbridge") continue
+                    for (sbn in activeNotifications) {
+                        val pkg = sbn.packageName
+                        if (pkg == "com.example.kakaodiscordbridge") continue
 
-                    val extras = sbn.notification.extras
-                    val nTitle = extras.getString("android.title") ?: ""
-                    val nText = extras.getCharSequence("android.text")?.toString() ?: ""
-                    if (nTitle.isEmpty() && nText.isEmpty()) continue
+                        val extras = sbn.notification.extras
+                        val nTitle = extras.getString("android.title") ?: ""
+                        val nText = extras.getCharSequence("android.text")?.toString() ?: ""
+                        if (nTitle.isEmpty() && nText.isEmpty()) continue
 
-                    val template = extras.getString("android.template") ?: ""
-                    if (template.contains("MediaStyle")) continue
-                    if (pkg == "com.android.systemui" && nTitle.matches(Regex("^[a-zA-Z\\s]+$"))) continue
+                        val template = extras.getString("android.template") ?: ""
+                        if (template.contains("MediaStyle")) continue
+                        if (pkg == "com.android.systemui" && nTitle.matches(Regex("^[a-zA-Z\\s]+$"))) continue
 
-                    val appName = try {
-                        val appInfo = packageManager.getApplicationInfo(pkg, 0)
-                        packageManager.getApplicationLabel(appInfo).toString()
-                    } catch (_: Exception) {
-                        pkg.substringAfterLast(".")
-                    }
+                        val appName = try {
+                            val appInfo = packageManager.getApplicationInfo(pkg, 0)
+                            packageManager.getApplicationLabel(appInfo).toString()
+                        } catch (_: Exception) {
+                            pkg.substringAfterLast(".")
+                        }
 
-                    val isOngoing = (sbn.notification.flags and Notification.FLAG_ONGOING_EVENT) != 0
-                    val time = java.text.SimpleDateFormat("HH:mm").format(java.util.Date(sbn.postTime))
+                        val isOngoing = (sbn.notification.flags and Notification.FLAG_ONGOING_EVENT) != 0
+                        val time = java.text.SimpleDateFormat("HH:mm").format(java.util.Date(sbn.postTime))
 
-                    var displayTitle = nTitle
-                    val displayText = nText
-                    if (pkg == KAKAO_PACKAGE) {
-                        val isGroup = extras.getBoolean("android.isGroupConversation", false)
-                        if (isGroup) {
-                            val chatId = sbn.tag ?: ""
-                            val channelId = channelManager?.getChannelId(chatId)
-                            if (channelId != null) {
-                                val cachedName = channelNameCache[channelId]
-                                if (cachedName != null) {
-                                    displayTitle = "[$cachedName] $nTitle"
-                                } else {
-                                    try {
-                                        val channelInfo = api?.getChannel(channelId)
-                                        val channelName = channelInfo?.optString("name", chatId) ?: chatId
-                                        channelNameCache[channelId] = channelName
-                                        displayTitle = "[$channelName] $nTitle"
-                                    } catch (_: Exception) {}
+                        var displayTitle = nTitle
+                        val displayText = nText
+                        if (pkg == KAKAO_PACKAGE) {
+                            val isGroup = extras.getBoolean("android.isGroupConversation", false)
+                            if (isGroup) {
+                                val chatId = sbn.tag ?: ""
+                                val channelId = channelManager?.getChannelId(chatId)
+                                if (channelId != null) {
+                                    val cachedName = channelNameCache[channelId]
+                                    if (cachedName != null) {
+                                        displayTitle = "[$cachedName] $nTitle"
+                                    } else {
+                                        try {
+                                            val channelInfo = api?.getChannel(channelId)
+                                            val channelName = channelInfo?.optString("name", chatId) ?: chatId
+                                            channelNameCache[channelId] = channelName
+                                            displayTitle = "[$channelName] $nTitle"
+                                        } catch (_: Exception) {}
+                                    }
                                 }
                             }
                         }
+
+                        if (isOngoing) {
+                            pinned.add("📌 **$appName** | $displayTitle: $displayText")
+                        } else {
+                            messages.add("$time **$appName** | $displayTitle: $displayText")
+                        }
                     }
 
-                    if (isOngoing) {
-                        pinned.add("📌 **$appName** | $displayTitle: $displayText")
+                    val description = StringBuilder()
+                    if (messages.isNotEmpty()) {
+                        description.appendLine("🔔 **알림**")
+                        messages.forEach { description.appendLine(it) }
+                    }
+                    if (pinned.isNotEmpty()) {
+                        if (messages.isNotEmpty()) description.appendLine()
+                        description.appendLine("📌 **고정**")
+                        pinned.forEach { description.appendLine(it) }
+                    }
+                    if (messages.isEmpty() && pinned.isEmpty()) {
+                        description.append("알림 없음")
+                    }
+
+                    val embed = org.json.JSONObject()
+                        .put("title", "알림창")
+                        .put("description", description.toString())
+                        .put("footer", org.json.JSONObject().put("text",
+                            "동기화: ${java.text.SimpleDateFormat("HH:mm:ss").format(java.util.Date())}"))
+                        .put("color", 0x2F3136)
+
+                    val json = org.json.JSONObject().put("embeds", org.json.JSONArray().put(embed))
+
+                    if (alertEmbedMessageId != null) {
+                        val editResult = api?.editEmbed(config!!.alertChannelId, alertEmbedMessageId!!, embed)
+                        if (editResult == null || editResult.has("code")) {
+                            try { api?.deleteMessage(config!!.alertChannelId, alertEmbedMessageId!!) } catch (_: Exception) {}
+                            alertEmbedMessageId = null
+                            val result = api?.sendRawJson(config!!.alertChannelId, json)
+                            alertEmbedMessageId = result?.optString("id")
+                        }
                     } else {
-                        messages.add("$time **$appName** | $displayTitle: $displayText")
-                    }
-                }
-
-                val description = StringBuilder()
-                if (messages.isNotEmpty()) {
-                    description.appendLine("🔔 **알림**")
-                    messages.forEach { description.appendLine(it) }
-                }
-                if (pinned.isNotEmpty()) {
-                    if (messages.isNotEmpty()) description.appendLine()
-                    description.appendLine("📌 **고정**")
-                    pinned.forEach { description.appendLine(it) }
-                }
-                if (messages.isEmpty() && pinned.isEmpty()) {
-                    description.append("알림 없음")
-                }
-
-                val embed = org.json.JSONObject()
-                    .put("title", "알림창")
-                    .put("description", description.toString())
-                    .put("footer", org.json.JSONObject().put("text",
-                        "동기화: ${java.text.SimpleDateFormat("HH:mm:ss").format(java.util.Date())}"))
-                    .put("color", 0x2F3136)
-
-                val json = org.json.JSONObject().put("embeds", org.json.JSONArray().put(embed))
-
-                if (alertEmbedMessageId != null) {
-                    val editResult = api?.editEmbed(config!!.alertChannelId, alertEmbedMessageId!!, embed)
-                    if (editResult == null || editResult.has("code")) {
-                        try { api?.deleteMessage(config!!.alertChannelId, alertEmbedMessageId!!) } catch (_: Exception) {}
-                        alertEmbedMessageId = null
+                        // 기존 봇 메시지 전부 삭제
+                        try {
+                            val oldMessages = api?.getMessages(config!!.alertChannelId, limit = 10)
+                            if (oldMessages != null) {
+                                for (i in 0 until oldMessages.length()) {
+                                    val msg = oldMessages.getJSONObject(i)
+                                    if (msg.optJSONObject("author")?.optBoolean("bot", false) == true) {
+                                        api?.deleteMessage(config!!.alertChannelId, msg.getString("id"))
+                                        Thread.sleep(300)
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {}
                         val result = api?.sendRawJson(config!!.alertChannelId, json)
                         alertEmbedMessageId = result?.optString("id")
                     }
-                } else {
-                    try {
-                        val oldMessages = api?.getMessages(config!!.alertChannelId, limit = 10)
-                        if (oldMessages != null) {
-                            for (i in 0 until oldMessages.length()) {
-                                val msg = oldMessages.getJSONObject(i)
-                                if (msg.optJSONObject("author")?.optBoolean("bot", false) == true) {
-                                    api?.deleteMessage(config!!.alertChannelId, msg.getString("id"))
-                                }
-                            }
-                        }
-                    } catch (_: Exception) {}
-                    val result = api?.sendRawJson(config!!.alertChannelId, json)
-                    alertEmbedMessageId = result?.optString("id")
+                } catch (e: Exception) {
+                    Log.e(TAG, "알림 동기화 오류: $e")
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "알림 동기화 오류: $e")
             }
         }.start()
     }
