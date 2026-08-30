@@ -89,13 +89,6 @@ class DiscordApi(private val botToken: String) {
         return post("/channels/$channelId/messages", json)
     }
 
-    fun sendDivider(channelId: String, senderName: String): JSONObject? {
-        val embed = JSONObject()
-            .put("color", generateColor(senderName))
-            .put("author", JSONObject().put("name", "── $senderName ──"))
-        return post("/channels/$channelId/messages", JSONObject().put("embeds", JSONArray().put(embed)))
-    }
-
     fun sendRawJson(channelId: String, json: JSONObject): JSONObject? {
         return post("/channels/$channelId/messages", json)
     }

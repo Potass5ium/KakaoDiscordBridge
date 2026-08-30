@@ -35,7 +35,6 @@ class NotificationListener : NotificationListenerService() {
     private val replyActions = ConcurrentHashMap<String, Notification.Action>()
     private val sentMessages = mutableListOf<Triple<String, String, Long>>()
     private val channelNameCache = ConcurrentHashMap<String, String>()
-    private val lastSenderByRoom = ConcurrentHashMap<String, String>()
 
     // ======================== 초기화 ========================
 
@@ -202,16 +201,6 @@ class NotificationListener : NotificationListenerService() {
 
         if (setupComplete) {
             Thread {
-                // 그룹채팅: 발신자 바뀌면 색상 구분 임베드 추가
-                if (isGroup) {
-                    val lastSender = lastSenderByRoom[room]
-                    if (lastSender != null && lastSender != sender) {
-                        // 발신자 변경: 새 발신자 색상의 빈 구분선 임베드
-                        val channelId = channelManager?.getOrCreateChannel(room, displayName) ?: return@Thread
-                        api?.sendDivider(channelId, sender)
-                    }
-                    lastSenderByRoom[room] = sender
-                }
                 forwardToDiscord(room, sender, text, displayName)
             }.start()
         } else {
