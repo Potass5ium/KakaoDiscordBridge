@@ -28,12 +28,37 @@ class NotificationListener : NotificationListenerService() {
     private var cleanupThread: Thread? = null
 
     private var syncLock = Object()
-    private var lastKakaoMsg = ""
-    private var lastKakaoTime = 0L
+    private val lastMessageByRoom = ConcurrentHashMap<String, String>()
 
     private val pendingMessages = java.util.concurrent.LinkedBlockingQueue<Triple<String, String, Notification>>()
     private val replyActions = ConcurrentHashMap<String, Notification.Action>()
-    private val sentMessages = mutableListOf<Triple<String, String, Long>>()
+    private fun saveSentMessage(channelId: String, messageId: String, timestamp: Long) {
+        val prefs = getSharedPreferences("sent_messages", MODE_PRIVATE)
+        val key = "$channelId:$messageId"
+        prefs.edit().putLong(key, timestamp).apply()
+    }
+
+    private fun getExpiredMessages(): List<Triple<String, String, Long>> {
+        val prefs = getSharedPreferences("sent_messages", MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val expired = mutableListOf<Triple<String, String, Long>>()
+        val allEntries = prefs.all
+        for ((key, value) in allEntries) {
+            val timestamp = value as? Long ?: continue
+            if (now - timestamp > 24 * 60 * 60 * 1000) {
+                val parts = key.split(":", limit = 2)
+                if (parts.size == 2) {
+                    expired.add(Triple(parts[0], parts[1], timestamp))
+                }
+            }
+        }
+        return expired
+    }
+
+    private fun removeSentMessage(channelId: String, messageId: String) {
+        val prefs = getSharedPreferences("sent_messages", MODE_PRIVATE)
+        prefs.edit().remove("$channelId:$messageId").apply()
+    }
     private val channelNameCache = ConcurrentHashMap<String, String>()
 
     // ======================== 초기화 ========================
@@ -167,17 +192,15 @@ class NotificationListener : NotificationListenerService() {
     private fun handleKakao(title: String, text: String, extras: Bundle, notification: Notification, sbn: StatusBarNotification) {
         if (text.contains("보이스톡") || text.contains("통화 중") || text.contains("연결 중")) return
 
-        // 중복 메시지 체크
-        val msgKey = "${title}:${text}"
-        val now = System.currentTimeMillis()
-        if (msgKey == lastKakaoMsg && now - lastKakaoTime < 3000) return
-        lastKakaoMsg = msgKey
-        lastKakaoTime = now
-
         val isGroup = extras.getBoolean("android.isGroupConversation", false)
         val subText = extras.getCharSequence("android.subText")?.toString() ?: ""
         val sender = title
         val room = if (isGroup) (sbn.tag ?: "group_unknown") else if (subText.isNotEmpty()) subText else title
+
+        // 중복 체크: 같은 방에서 같은 메시지면 무시
+        val msgKey = "$sender:$text"
+        if (lastMessageByRoom[room] == msgKey) return
+        lastMessageByRoom[room] = msgKey
 
         // Reply Action 저장
         notification.actions?.forEach { action ->
@@ -215,9 +238,7 @@ class NotificationListener : NotificationListenerService() {
             val channelId = channelManager?.getOrCreateChannel(room, displayName) ?: return
             val result = api?.sendEmbed(channelId, sender, message, sender)
             if (result?.has("id") == true) {
-                synchronized(sentMessages) {
-                    sentMessages.add(Triple(channelId, result.getString("id"), System.currentTimeMillis()))
-                }
+                saveSentMessage(channelId, result.getString("id"), System.currentTimeMillis())
             }
         } catch (e: Exception) {
             Log.e(TAG, "포워딩 오류: $e")
@@ -394,27 +415,62 @@ class NotificationListener : NotificationListenerService() {
         cleanupThread = Thread {
             while (true) {
                 try {
-                    Thread.sleep(60 * 60 * 1000)
-                    val now = System.currentTimeMillis()
-                    val expired = mutableListOf<Triple<String, String, Long>>()
-                    synchronized(sentMessages) {
-                        val iter = sentMessages.iterator()
-                        while (iter.hasNext()) {
-                            val msg = iter.next()
-                            if (now - msg.third > 24 * 60 * 60 * 1000) {
-                                expired.add(msg)
-                                iter.remove()
-                            }
-                        }
-                    }
+                    Thread.sleep(60 * 60 * 1000) // 1시간마다
+
+                    // 24시간 지난 메시지 삭제
+                    val expired = getExpiredMessages()
                     for ((chId, msgId, _) in expired) {
                         api?.deleteMessage(chId, msgId)
+                        removeSentMessage(chId, msgId)
                         Thread.sleep(500)
                     }
+                    if (expired.isNotEmpty()) {
+                        Log.d(TAG, "자동 삭제: ${expired.size}개 메시지")
+                    }
+
+                    // 개인채팅 빈 채널 삭제
+                    cleanupEmptyChannels()
+
                 } catch (_: InterruptedException) { break }
                 catch (e: Exception) { Log.e(TAG, "클린업 오류: $e") }
             }
         }.apply { isDaemon = true; start() }
+    }
+
+    private fun cleanupEmptyChannels() {
+        try {
+            val channels = api?.getChannels(config!!.serverId) ?: return
+            val prefs = getSharedPreferences("sent_messages", MODE_PRIVATE)
+            val allMessages = prefs.all
+
+            for (i in 0 until channels.length()) {
+                val ch = channels.getJSONObject(i)
+                if (ch.getInt("type") != 0) continue
+                if (ch.optString("parent_id", "") != config!!.categoryId) continue
+
+                val channelId = ch.getString("id")
+                val topic = ch.optString("topic", "")
+
+                // 그룹채팅 스킵 (topic이 숫자로만 되어있으면 그룹)
+                if (topic.matches(Regex("^\\d+$"))) continue
+
+                // 이 채널에 남아있는 메시지가 있는지 확인
+                val hasMessages = allMessages.keys.any { it.startsWith("$channelId:") }
+                if (hasMessages) continue
+
+                // 채널에 실제 메시지가 있는지 Discord에서 확인
+                val msgs = api?.getMessages(channelId, limit = 1)
+                if (msgs == null || msgs.length() == 0) {
+                    // 빈 채널 삭제
+                    api?.deleteChannel(channelId)
+                    channelManager?.removeChannel(topic)
+                    Log.d(TAG, "빈 채널 삭제: ${ch.getString("name")}")
+                    Thread.sleep(500)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "채널 정리 오류: $e")
+        }
     }
 
     // ======================== 서비스 제어 ========================

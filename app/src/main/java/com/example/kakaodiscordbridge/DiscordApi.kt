@@ -167,4 +167,19 @@ class DiscordApi(private val botToken: String) {
         )
         return colors[Math.abs(hash) % colors.size]
     }
+
+    fun deleteChannel(channelId: String): Boolean {
+        return try {
+            val request = Request.Builder()
+                .url("$BASE_URL/channels/$channelId")
+                .header("Authorization", "Bot $botToken")
+                .header("User-Agent", "DiscordBot (https://github.com/user/bot, 1.0)")
+                .delete()
+                .build()
+            client.newCall(request).execute().isSuccessful
+        } catch (e: Exception) {
+            Log.e(TAG, "채널 삭제 오류: $e")
+            false
+        }
+    }
 }

@@ -103,4 +103,10 @@ class ChannelManager(
 
     // 채널 수
     fun size(): Int = channelMap.size
+
+    fun removeChannel(room: String) {
+        channelMap.remove(room)
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().remove(room).apply()
+    }
 }
