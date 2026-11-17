@@ -431,6 +431,9 @@ class NotificationListener : NotificationListenerService() {
                     // 개인채팅 빈 채널 삭제
                     cleanupEmptyChannels()
 
+                    // 7일 지난 로그 메시지 삭제
+                    cleanupOldLogs()
+
                 } catch (_: InterruptedException) { break }
                 catch (e: Exception) { Log.e(TAG, "클린업 오류: $e") }
             }
@@ -470,6 +473,33 @@ class NotificationListener : NotificationListenerService() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "채널 정리 오류: $e")
+        }
+    }
+
+    private fun cleanupOldLogs() {
+        try {
+            val logChannelId = config?.logChannelId ?: return
+            val sevenDaysMs = 7L * 24 * 60 * 60 * 1000
+            val now = System.currentTimeMillis()
+            var deletedCount = 0
+
+            // Discord snowflake: (id >> 22) + 1420070400000 = timestamp ms
+            val messages = api?.getMessages(logChannelId, limit = 100) ?: return
+            for (i in 0 until messages.length()) {
+                val msg = messages.getJSONObject(i)
+                val msgId = msg.getString("id")
+                val msgTimestamp = (msgId.toLong() shr 22) + 1420070400000L
+                if (now - msgTimestamp > sevenDaysMs) {
+                    api?.deleteMessage(logChannelId, msgId)
+                    deletedCount++
+                    Thread.sleep(500)
+                }
+            }
+            if (deletedCount > 0) {
+                Log.d(TAG, "로그 정리: ${deletedCount}개 삭제")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "로그 정리 오류: $e")
         }
     }
 
