@@ -74,7 +74,7 @@ class ChannelManager(
 
         // 채널 이름: displayName이 있으면 사용, 없으면 room 사용
         val nameSource = displayName ?: room
-        val isGroup = room.matches(Regex("^\\d+$"))
+        val isGroup = displayName != null || room.matches(Regex("^\\d+$"))
         var channelName = nameSource.replace("\\s+".toRegex(), "-").lowercase()
         if (isGroup) channelName = "그룹채팅-$channelName"
         if (channelName.length > 100) channelName = channelName.substring(0, 100)
