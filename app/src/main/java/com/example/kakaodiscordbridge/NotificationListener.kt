@@ -239,6 +239,15 @@ class NotificationListener : NotificationListenerService() {
             val result = api?.sendEmbed(channelId, sender, message, sender)
             if (result?.has("id") == true) {
                 saveSentMessage(channelId, result.getString("id"), System.currentTimeMillis())
+            } else if (result?.optInt("code", 0) == 10003) {
+                // Unknown Channel - 삭제된 채널. 맵에서 제거 후 재생성
+                Log.d(TAG, "채널 삭제됨 감지: $room, 재생성 시도")
+                channelManager?.removeChannel(room)
+                val newChannelId = channelManager?.getOrCreateChannel(room, displayName) ?: return
+                val retryResult = api?.sendEmbed(newChannelId, sender, message, sender)
+                if (retryResult?.has("id") == true) {
+                    saveSentMessage(newChannelId, retryResult.getString("id"), System.currentTimeMillis())
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "포워딩 오류: $e")
@@ -430,6 +439,9 @@ class NotificationListener : NotificationListenerService() {
 
                     // 개인채팅 빈 채널 삭제
                     cleanupEmptyChannels()
+
+                    // 서버와 채널맵 동기화
+                    channelManager?.syncFromServer()
 
                     // 7일 지난 로그 메시지 삭제
                     cleanupOldLogs()
